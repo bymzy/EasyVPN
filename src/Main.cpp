@@ -15,11 +15,13 @@
 #include <memory.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <assert.h>
 
 #include <iostream>
 
+const int MAX_BUF_SIZE = 2000;
 const char *cloneTun = "/dev/net/tun";
-const char *remoteIp = "192.168.76.17";
+const char *remoteIp = "192.168.76.21";
 const short remotePort = 5656;
 
 void Debug(const char *msg, ...)
@@ -38,7 +40,7 @@ int AllocTun(char *tunName, int flags, int &fd)
 
     do {
         fd = open(cloneTun, O_RDWR);
-        if (fd < 0) {
+        if (fd <= 0) {
             err = errno;
             perror("open clone dev failed");
             break;
@@ -56,19 +58,19 @@ int AllocTun(char *tunName, int flags, int &fd)
             break;
         }
 
-        /*
+        
         err = ioctl(fd, TUNSETPERSIST, 1);
         if (err != 0) {
             perror("set tun device persist failed!");
             break;
         }
-        */
+        
 
         strcpy(tunName, ifr.ifr_name);
     } while(0);
 
     
-    Debug("AllocTun, error: %d\n", err);
+    //Debug("AllocTun, error: %d, tunfd: %d \n", err, fd);
     return err;
 }
 
@@ -93,7 +95,35 @@ int ConnectRemote(const char *serverIP, const short serverPort, int &netFD)
     return err;
 }
 
-int ServerPrepare(const char *serverIP, const short serverPort, int &netFD)
+int RecvNBytes(int fd, char *buf, uint32_t toRecv)
+{
+    Debug("RecvNBytes going to recv %d bytes\n", toRecv);
+    int err = 0;
+    uint32_t totalRecved = 0;
+    ssize_t recved = 0;
+
+    while (toRecv > 0) {
+
+        do {
+            recved = recv(fd, buf + totalRecved, toRecv, 0);
+        } while(recved < 0 && ((errno == EAGAIN) || (errno == EWOULDBLOCK)));
+
+        if (recved < 0) {
+            err = errno;
+            break;
+        } else if (recved == 0) {
+            err = EINVAL;
+            break;
+        }
+
+        toRecv -= recved;
+        totalRecved += recved;
+    }
+
+    return err;
+}
+
+int ServerPrepare(const char *serverIP, const short serverPort, int netFD, int &clientSock)
 {
     int err = 0;
 
@@ -103,6 +133,8 @@ int ServerPrepare(const char *serverIP, const short serverPort, int &netFD)
     remoteAddr.sin_port = htons(serverPort);
     remoteAddr.sin_addr.s_addr = inet_addr(serverIP);
     int optval = 1;
+    socklen_t clientSockAddrLen;
+    struct sockaddr_in clientSockAddr;
 
     do {
         err = setsockopt(netFD, SOL_SOCKET, SO_REUSEADDR, (char *)&optval, sizeof(optval));
@@ -124,7 +156,14 @@ int ServerPrepare(const char *serverIP, const short serverPort, int &netFD)
             break;
         }
 
-        Debug("vpn server listen succeed!");
+        clientSock = accept(netFD, (struct sockaddr*)&clientSockAddr, &clientSockAddrLen);
+        if (clientSock < 0) {
+            err = errno;
+            Debug("accept failed, err:%d, errstr:%s\n", err, strerror(err));
+            break;
+        }
+
+        Debug("vpn server accpet client succeed!\n");
     } while(0);
 
     return err;
@@ -155,6 +194,10 @@ int VPNLoop(int tunFD, int netFD, bool client)
     struct sockaddr_in clientAddr;
     socklen_t addrlen = 0;
     int workFD = -1;
+    char buf[MAX_BUF_SIZE];
+    ssize_t readed = 0;
+    ssize_t sent = 0;
+    uint32_t packetLength = 0;
 
     do {
         epollFD = epoll_create(10);
@@ -169,9 +212,18 @@ int VPNLoop(int tunFD, int netFD, bool client)
             break;
         }
 
-        ev.events = EPOLLIN;
+        ev.events = EPOLLIN | EPOLLET;
         ev.data.fd = netFD;
         err = epoll_ctl(epollFD, EPOLL_CTL_ADD, netFD, &ev);
+        if (err != 0) {
+            err = errno;
+            Debug("epool_tl failed, err: %d, errstr: %s\n", err, strerror(err));
+            break;
+        }
+
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.fd = tunFD;
+        err = epoll_ctl(epollFD, EPOLL_CTL_ADD, tunFD, &ev);
         if (err != 0) {
             err = errno;
             Debug("epool_tl failed, err: %d, errstr: %s\n", err, strerror(err));
@@ -188,32 +240,53 @@ int VPNLoop(int tunFD, int netFD, bool client)
 
             for (iter = 0; iter < nfds; ++iter) {
                 workFD = events[iter].data.fd;
-                if (!client) {
-                    if (workFD == netFD) {
-                        newSock = accept(netFD, (struct sockaddr*)&clientAddr, &addrlen);
-                        if (newSock < 0) {
-                            err = errno;
-                            Debug("accept new socket client failed!");
-                            break;
-                        }
-
-                        err = SetNonblocking(newSock);
-                        if (err < 0) {
-                            err = errno;
-                            Debug("set nonblocking new socket client failed!");
-                            break;
-                        }
-
-                        ev.events = EPOLLIN | EPOLLET;
-                        ev.data.fd = newSock;
-                        err = epoll_ctl(epollFD, EPOLL_CTL_ADD, newSock, &ev);
-                        if (err < 0) {
-                            err = errno;
-                            Debug("epoll_ctl failed,err: %d, errstr: %s\n", err, strerror(err));
-                            break;
-                        }
+                if (workFD == netFD) {
+                    uint32_t temp;
+                    packetLength = 0;
+                    err = RecvNBytes(netFD, (char *)&packetLength, sizeof(packetLength));
+                    if (err != 0) {
+                        Debug("recv from netfd failed!, err: %d, errstr: %s\n",
+                                err, strerror(err));
+                        break;
                     }
+                    temp = ntohl(packetLength);
+                    Debug("going to recv %d bytes from netfd\n", temp);
+
+                    err = RecvNBytes(netFD, buf, temp);
+                    if (err != 0) {
+                        Debug("recv packet failed, err: %d, errstr: %s\n",
+                                err, strerror(err));
+                        break;
+                    }
+
+                    write(tunFD, buf, temp);
+                    Debug("Write %d bytes to tun \n", temp);
+                } else if (workFD == tunFD) {
+
+                    packetLength = 0;
+                    readed = read(tunFD, buf, MAX_BUF_SIZE); 
+                    Debug("read %d bytes from tun \n", readed);
+                    packetLength = htonl(readed);
+                    sent = send(netFD, &packetLength, sizeof(packetLength), 0);
+                    if (sent < 0) {
+                        err = errno;
+                        Debug("send to network failed, errstr: %s\n", strerror(err));
+                    }
+                    Debug("send packetLength %d \n", packetLength);
+
+                    sent = send(netFD, buf, readed, 0);
+                    if (sent < 0) {
+                        err = errno;
+                        Debug("send to network failed, errstr: %s\n", strerror(err));
+                    }
+                    assert(sent == ntohl(packetLength));
+
+                    Debug("send %d bytes to netfd \n", sent);
                 }
+            }
+
+            if (err != 0) {
+                break;
             }
         }
 
@@ -243,11 +316,20 @@ int main(int argc, char * argv[])
 {
     int err = 0;
     char tunName[IFNAMSIZ] = {0};
+    sprintf(tunName, "tun0", 4);
+
     int tunFD = -1;
     int netFD = -1;
+    int clientSock = -1;
     bool client = true;
 
     do {
+        if (argc != 2) {
+            err = EINVAL;
+            Debug("more args needed!\n");
+            break;
+        }
+
         if (strcmp(argv[1], "c") == 0) {
             client = true;
         } else if (strcmp(argv[1], "s") == 0) {
@@ -258,11 +340,11 @@ int main(int argc, char * argv[])
             break;
         }
 
-        err = AllocTun(tunName, IFF_TUN, tunFD);
+        err = AllocTun(tunName, IFF_TUN | IFF_NO_PI, tunFD);
         if (err != 0) {
             break;
         }
-        Debug("Tun Name: %s\n", tunName);
+        Debug("Tun Name: %s, tunFD: %d \n", tunName, tunFD);
 
         err = AllocSocket(netFD);
         if (err != 0) {
@@ -277,18 +359,29 @@ int main(int argc, char * argv[])
             }
         } else {
             /* this is a vpn server */
-            err = ServerPrepare(remoteIp, remotePort, netFD);
+            err = ServerPrepare(remoteIp, remotePort, netFD, clientSock);
             if (err != 0) {
                 break;
             }
+
+            close(netFD);
+            netFD = clientSock;
         }
 
+        Debug("VPNLoop tunFD: %d, netFD: %d \n", tunFD, netFD);
         err = VPNLoop(tunFD, netFD, client);
 
     } while(0);
 
+    if (netFD > 0) {
+        close(netFD);
+    }
+
+    if (tunFD > 0) {
+        close(tunFD);
+    }
+
     return err;
 }
-
 
 
