@@ -16,13 +16,12 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <assert.h>
+#include <getopt.h>
 
 #include <iostream>
 
 const int MAX_BUF_SIZE = 2000;
 const char *cloneTun = "/dev/net/tun";
-const char *remoteIp = "192.168.76.21";
-const short remotePort = 5656;
 
 void Debug(const char *msg, ...)
 {
@@ -101,11 +100,14 @@ int RecvNBytes(int fd, char *buf, uint32_t toRecv)
     int err = 0;
     uint32_t totalRecved = 0;
     ssize_t recved = 0;
+    struct sockaddr_in remoteAddr;
+    socklen_t sockLen = 0;
 
     while (toRecv > 0) {
 
         do {
-            recved = recv(fd, buf + totalRecved, toRecv, 0);
+            recved = recvfrom(fd, buf + totalRecved, toRecv, 0,
+                    (struct sockaddr*)&remoteAddr, &sockLen);
         } while(recved < 0 && ((errno == EAGAIN) || (errno == EWOULDBLOCK)));
 
         if (recved < 0) {
@@ -123,15 +125,43 @@ int RecvNBytes(int fd, char *buf, uint32_t toRecv)
     return err;
 }
 
-int ServerPrepare(const char *serverIP, const short serverPort, int netFD, int &clientSock)
+int SendNBytes(int fd, char *buf, uint32_t toSend, struct sockaddr_in *remoteAddr, socklen_t len)
+{
+    Debug("SendNBytes going to send \%d bytes\n", toSend);
+    int err = 0;
+    uint32_t totalSent = 0;
+    ssize_t sent = 0;
+
+    while (toSend > 0) {
+        do {
+            sent = sendto(fd, buf + totalSent, toSend, 0,
+                    (struct sockaddr*)remoteAddr, len);
+        } while(sent < 0 && ((errno == EAGAIN) || (errno == EWOULDBLOCK)));
+
+        if (sent < 0) {
+            err = errno;
+            break;
+        } else if (0 == sent) {
+            err = EINVAL;
+            break;
+        }
+
+        toSend -= sent;
+        totalSent += sent;
+    }
+
+    return err;
+}
+
+int ServerPrepare(const char *serverIP, const short serverPort, int netFD)
 {
     int err = 0;
 
-    struct sockaddr_in remoteAddr;
-    memset(&remoteAddr, 0, sizeof(sockaddr_in));
-    remoteAddr.sin_family = AF_INET;
-    remoteAddr.sin_port = htons(serverPort);
-    remoteAddr.sin_addr.s_addr = inet_addr(serverIP);
+    struct sockaddr_in localAddr;
+    memset(&localAddr, 0, sizeof(sockaddr_in));
+    localAddr.sin_family = AF_INET;
+    localAddr.sin_port = htons(serverPort);
+    localAddr.sin_addr.s_addr = inet_addr(serverIP);
     int optval = 1;
     socklen_t clientSockAddrLen;
     struct sockaddr_in clientSockAddr;
@@ -144,26 +174,11 @@ int ServerPrepare(const char *serverIP, const short serverPort, int netFD, int &
             break;
         }
 
-        err = bind(netFD, (struct sockaddr*)&remoteAddr, sizeof(sockaddr));
+        err = bind(netFD, (struct sockaddr*)&localAddr, sizeof(sockaddr));
         if (err != 0) {
             break;
         }
 
-        err = listen(netFD, 10);
-        if (err != 0) {
-            err = errno;
-            Debug("listen failed, err:%d, errstr:%s\n", err, strerror(err));
-            break;
-        }
-
-        clientSock = accept(netFD, (struct sockaddr*)&clientSockAddr, &clientSockAddrLen);
-        if (clientSock < 0) {
-            err = errno;
-            Debug("accept failed, err:%d, errstr:%s\n", err, strerror(err));
-            break;
-        }
-
-        Debug("vpn server accpet client succeed!\n");
     } while(0);
 
     return err;
@@ -295,15 +310,44 @@ int VPNLoop(int tunFD, int netFD, bool client)
     return err;
 }
 
-int ParseArgs(int argc, char * argv[])
+int ParseArgs(int argc, char * argv[], bool& client)
 {
+    int err = 0;
+    int opt;
 
+    /* TODO FIXME*/
+    while ((opt = getopt(argc, argv, "r:i:p:t:h"))) {
+        switch (opt) {
+            case ''
+                break;
+        }
+    }
+    
+    do {
+        if (argc != 2) {
+            err = EINVAL;
+            Debug("more args needed!\n");
+            break;
+        }
+
+        if (strcmp(argv[1], "c") == 0) {
+            client = true;
+        } else if (strcmp(argv[1], "s") == 0) {
+            client = false;
+        } else {
+            fprintf(stderr, "vpn role not specified!");
+            err = EINVAL;
+            break;
+        }
+    } while(0);
+
+    return err;
 }
 
 int AllocSocket(int &sf)
 {
     int err = 0;
-    sf = socket(AF_INET, SOCK_STREAM, 0);
+    sf = socket(AF_INET, SOCK_DGRAM, 0);
     if (sf < 0) {
         err = errno;
         perror("create socket failed!");
@@ -323,22 +367,13 @@ int main(int argc, char * argv[])
     int clientSock = -1;
     bool client = true;
 
-    do {
-        if (argc != 2) {
-            err = EINVAL;
-            Debug("more args needed!\n");
-            break;
-        }
+    char *localIP
+    short localPort;
+    char *remoteIP;
+    short remotePort;
 
-        if (strcmp(argv[1], "c") == 0) {
-            client = true;
-        } else if (strcmp(argv[1], "s") == 0) {
-            client = false;
-        } else {
-            fprintf(stderr, "vpn role not specified!");
-            err = EINVAL;
-            break;
-        }
+    do {
+        err = ParseArgs(argc, argv);
 
         err = AllocTun(tunName, IFF_TUN | IFF_NO_PI, tunFD);
         if (err != 0) {
@@ -351,21 +386,12 @@ int main(int argc, char * argv[])
             break;
         }
 
-        if (client) {
-            /* this is a vpn client */
-            err = ConnectRemote(remoteIp, remotePort, netFD);
-            if (err != 0) {
-                break;
-            }
-        } else {
+        if (!client) {
             /* this is a vpn server */
-            err = ServerPrepare(remoteIp, remotePort, netFD, clientSock);
+            err = ServerPrepare(remoteIP, remotePort, netFD);
             if (err != 0) {
                 break;
             }
-
-            close(netFD);
-            netFD = clientSock;
         }
 
         Debug("VPNLoop tunFD: %d, netFD: %d \n", tunFD, netFD);
