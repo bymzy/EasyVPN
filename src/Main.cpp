@@ -23,13 +23,30 @@
 const int MAX_BUF_SIZE = 2000;
 const char *cloneTun = "/dev/net/tun";
 
-void Debug(const char *msg, ...)
+
+void Error(const char *fmt, ...)
+{ 
+    va_list ag;
+    va_start(ag, fmt);
+    vfprintf(stderr, fmt, ag);
+    va_end(ag);
+}
+
+void Debug(const char *fmt, ...)
 {
     va_list argp;
 
-    va_start(argp, msg);
-    vfprintf(stdout, msg ,argp);
+    va_start(argp, fmt);
+    vfprintf(stdout, fmt,argp);
     va_end(argp);
+}
+
+void Usage()
+{
+    Error("Usage: UDPTun -i <remoteIP> -p <remotePort> -t <localPort> [-h]\n");
+    Error("        -i remote udp ip\n");
+    Error("        -p remote udp port\n");
+    Error("        -t local udp port\n");
 }
 
 int AllocTun(char *tunName, int flags, int &fd)
@@ -125,7 +142,7 @@ int RecvNBytes(int fd, char *buf, uint32_t toRecv)
     return err;
 }
 
-int SendNBytes(int fd, char *buf, uint32_t toSend, struct sockaddr_in *remoteAddr, socklen_t len)
+int SendNBytes(int fd, char *buf, uint32_t toSend, struct sockaddr_in *remoteAddr)
 {
     Debug("SendNBytes going to send \%d bytes\n", toSend);
     int err = 0;
@@ -135,7 +152,7 @@ int SendNBytes(int fd, char *buf, uint32_t toSend, struct sockaddr_in *remoteAdd
     while (toSend > 0) {
         do {
             sent = sendto(fd, buf + totalSent, toSend, 0,
-                    (struct sockaddr*)remoteAddr, len);
+                    (struct sockaddr*)remoteAddr, sizeof(sockaddr_in));
         } while(sent < 0 && ((errno == EAGAIN) || (errno == EWOULDBLOCK)));
 
         if (sent < 0) {
@@ -196,7 +213,7 @@ int SetNonblocking(int fd)
     return err;
 }
 
-int VPNLoop(int tunFD, int netFD, bool client)
+int VPNLoop(int tunFD, int netFD, struct sockaddr_in *remoteAddr)
 {
     int epollFD = -1;
     int err = -1;
@@ -249,6 +266,11 @@ int VPNLoop(int tunFD, int netFD, bool client)
             nfds = epoll_wait(epollFD, events, MAX_EVENTS, -1);
             if (nfds < 0) {
                 err = errno;
+                if (EINTR == err) {
+                    err = 0;
+                    Debug("interupt!!!");
+                    continue;
+                }
                 Debug("epoll_wait failed, err: %d, errstr: %s\n", err, strerror(err));
                 break;
             }
@@ -282,21 +304,19 @@ int VPNLoop(int tunFD, int netFD, bool client)
                     readed = read(tunFD, buf, MAX_BUF_SIZE); 
                     Debug("read %d bytes from tun \n", readed);
                     packetLength = htonl(readed);
-                    sent = send(netFD, &packetLength, sizeof(packetLength), 0);
-                    if (sent < 0) {
-                        err = errno;
+
+                    err = SendNBytes(netFD, (char *)&packetLength, sizeof(packetLength), remoteAddr);
+                    if (0 != err) {
                         Debug("send to network failed, errstr: %s\n", strerror(err));
+                        break;
                     }
                     Debug("send packetLength %d \n", packetLength);
 
-                    sent = send(netFD, buf, readed, 0);
-                    if (sent < 0) {
-                        err = errno;
+                    err = SendNBytes(netFD, buf, readed, remoteAddr);
+                    if (0 != err) {
                         Debug("send to network failed, errstr: %s\n", strerror(err));
+                        break;
                     }
-                    assert(sent == ntohl(packetLength));
-
-                    Debug("send %d bytes to netfd \n", sent);
                 }
             }
 
@@ -310,36 +330,71 @@ int VPNLoop(int tunFD, int netFD, bool client)
     return err;
 }
 
-int ParseArgs(int argc, char * argv[], bool& client)
+int ParseArgs(int argc, char * argv[], bool& client, short& localPort,
+        char *remoteIP, short& remotePort, char *tunName)
 {
     int err = 0;
     int opt;
+    int tempPort = 0;
+    bool roleSet = false;
+    bool remoteIPSet = false;
+    bool remotePortSet = false;
+    bool localPortSet = false;
+    bool tunNameSet = false;
 
-    /* TODO FIXME*/
-    while ((opt = getopt(argc, argv, "r:i:p:t:h"))) {
+    while ((opt = getopt(argc, argv, "r:i:p:t:d:h")) != -1) {
         switch (opt) {
-            case ''
+            case 'r':
+                if (strcmp("s", (char*)optarg) == 0) {
+                    client = false;
+                } else if ("c", (char*)optarg) {
+                    client = true;
+                } else {
+                    err = EINVAL;
+                    Error("invalid role arg %s \n", (char*)optarg);
+                }
+                roleSet = true;
+                break;
+            case 'i':
+                strcpy(remoteIP, (char*)optarg);
+                struct in_addr addr;
+                if (inet_aton(remoteIP, &addr) == 0) {
+                    err = EINVAL;
+                    Error("invalid remote ip %s \n", (char*)optarg);
+                }
+                remoteIPSet = true;
+                break;
+            case 't':
+                tempPort = atoi((char*)optarg);
+                if (tempPort <= 0 && tempPort >= 65536) {
+                    err = EINVAL;
+                }
+                localPort = (short)tempPort;
+                localPortSet = true;
+                break;
+            case 'p':
+                tempPort = atoi((char*)optarg);
+                if (tempPort <= 0 && tempPort >= 65536) {
+                    err = EINVAL;
+                }
+                remotePort = (short)tempPort;
+                remotePortSet = true;
+                break;
+            case 'd':
+                strcpy(tunName, (char*)optarg);
+                tunNameSet = true;
+                break;
+            case 'h':
+                Usage();
                 break;
         }
-    }
-    
-    do {
-        if (argc != 2) {
-            err = EINVAL;
-            Debug("more args needed!\n");
-            break;
-        }
 
-        if (strcmp(argv[1], "c") == 0) {
-            client = true;
-        } else if (strcmp(argv[1], "s") == 0) {
-            client = false;
-        } else {
-            fprintf(stderr, "vpn role not specified!");
-            err = EINVAL;
+        if (0 != err) {
             break;
         }
-    } while(0);
+    }
+
+    /* TODO check every args used */
 
     return err;
 }
@@ -360,20 +415,25 @@ int main(int argc, char * argv[])
 {
     int err = 0;
     char tunName[IFNAMSIZ] = {0};
-    sprintf(tunName, "tun0", 4);
+    //sprintf(tunName, "tun0", 4);
 
     int tunFD = -1;
     int netFD = -1;
     int clientSock = -1;
     bool client = true;
 
-    char *localIP
-    short localPort;
-    char *remoteIP;
-    short remotePort;
+    short localPort = 0;
+    char remoteIP[16];
+    short remotePort = 0;
+    struct sockaddr_in remoteAddr;
 
     do {
-        err = ParseArgs(argc, argv);
+        err = ParseArgs(argc, argv, client, localPort, remoteIP, remotePort, tunName);
+        if (err != 0) {
+            break;
+        }
+
+        Debug("args: ip: %s, local port: %d, remote port: %d\n", remoteIP, localPort, remotePort);
 
         err = AllocTun(tunName, IFF_TUN | IFF_NO_PI, tunFD);
         if (err != 0) {
@@ -386,16 +446,19 @@ int main(int argc, char * argv[])
             break;
         }
 
-        if (!client) {
-            /* this is a vpn server */
-            err = ServerPrepare(remoteIP, remotePort, netFD);
-            if (err != 0) {
-                break;
-            }
+        /* this is a vpn server */
+        err = ServerPrepare("127.0.0.1", localPort, netFD);
+        if (err != 0) {
+            break;
         }
 
         Debug("VPNLoop tunFD: %d, netFD: %d \n", tunFD, netFD);
-        err = VPNLoop(tunFD, netFD, client);
+
+        remoteAddr.sin_family = AF_INET;
+        remoteAddr.sin_addr.s_addr = inet_addr(remoteIP);
+        remoteAddr.sin_port = htons(remotePort);
+
+        err = VPNLoop(tunFD, netFD, &remoteAddr);
 
     } while(0);
 
