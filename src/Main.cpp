@@ -152,7 +152,7 @@ int SendNBytes(int fd, char *buf, uint32_t toSend, struct sockaddr_in *remoteAdd
     while (toSend > 0) {
         do {
             sent = sendto(fd, buf + totalSent, toSend, 0,
-                    (struct sockaddr*)remoteAddr, sizeof(sockaddr_in));
+                    (struct sockaddr*)remoteAddr, sizeof(sockaddr));
         } while(sent < 0 && ((errno == EAGAIN) || (errno == EWOULDBLOCK)));
 
         if (sent < 0) {
@@ -307,14 +307,14 @@ int VPNLoop(int tunFD, int netFD, struct sockaddr_in *remoteAddr)
 
                     err = SendNBytes(netFD, (char *)&packetLength, sizeof(packetLength), remoteAddr);
                     if (0 != err) {
-                        Debug("send to network failed, errstr: %s\n", strerror(err));
+                        Debug("send to network failed, error: %d, errstr: %s\n", err, strerror(err));
                         break;
                     }
                     Debug("send packetLength %d \n", packetLength);
 
                     err = SendNBytes(netFD, buf, readed, remoteAddr);
                     if (0 != err) {
-                        Debug("send to network failed, errstr: %s\n", strerror(err));
+                        Debug("send to network failed, error: %d, errstr: %s\n", err, strerror(err));
                         break;
                     }
                 }
@@ -447,7 +447,7 @@ int main(int argc, char * argv[])
         }
 
         /* this is a vpn server */
-        err = ServerPrepare("127.0.0.1", localPort, netFD);
+        err = ServerPrepare("0.0.0.0", localPort, netFD);
         if (err != 0) {
             break;
         }
